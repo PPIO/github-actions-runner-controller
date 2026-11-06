@@ -1,0 +1,327 @@
+<div align="center">
+
+# PPIO Actions Runner Controller
+
+Run every GitHub Actions job in an isolated PPIO Sandbox, more affordably
+and with less operational overhead.
+
+[English](https://github.com/ppio/github-actions-runner-controller/blob/main/README.md) | [中文](https://github.com/ppio/github-actions-runner-controller/blob/main/README.zh.md)
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Go](https://img.shields.io/badge/Go-1.27.3-00ADD8.svg)
+![Runner](https://img.shields.io/badge/GitHub_Actions_Runner-2.337.0-2088FF.svg)
+![Deployment](https://img.shields.io/badge/recommended-PPIO_Hosted-7B61FF.svg)
+
+</div>
+
+This controller uses GitHub's official
+[`github.com/actions/scaleset`](https://github.com/actions/scaleset) client to
+receive assigned jobs and desired runner capacity. A long-running controller
+creates one fresh PPIO runner Sandbox for each job and kills it when the job
+finishes.
+
+> v0.1 uses the Scale Set API, which GitHub currently labels Public Preview.
+> The client API is stable, but its Go interfaces may evolve. This repository
+> pins `github.com/actions/scaleset v0.5.0`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    G["GitHub Actions<br/>assigned job and JIT config"] --> C["Controller Sandbox<br/>github-actions-controller"]
+    C --> T["Runner Template<br/>github-actions-runner"]
+    T --> R["Ephemeral Runner Sandbox<br/>one per job"]
+    R --> K["Job complete<br/>kill Sandbox"]
+```
+
+The same controller implementation supports two control-plane placements.
+PPIO Hosted is the recommended default because the controller remains online
+without depending on a user's machine:
+
+- **PPIO Hosted:** run that controller image in a long-running Control
+  Sandbox, which creates separate ephemeral runner Sandboxes.
+- **Local Docker:** run the same controller image on a user's machine with
+  credentials supplied through environment variables.
+
+The runner JIT configuration travels over the adapter's stdin and the Sandbox
+filesystem API. The adapter atomically publishes the completed file; the runner
+entrypoint reads and unlinks it, then exports it only to the runner child
+process as `ACTIONS_RUNNER_INPUT_JITCONFIG`. It is never included in Sandbox
+creation environment values, metadata, process arguments, or controller logs.
+
+## Recommended: PPIO Hosted
+
+Hosted mode uses these public PPIO Templates directly; users do not build
+either Template:
+
+| Role | Public Template |
+|---|---|
+| Control Sandbox | `github-actions-controller` |
+| Ephemeral CI runner | `github-actions-runner` |
+
+### Before deployment
+
+Prepare the following on the machine where you run the deployment script:
+
+- Bash and Python 3.
+- Node.js 20+ and npm if the `ppio` CLI is not already installed.
+- The latest `ppio` CLI (version 2.1.0 or newer). The `PPIO_API_KEY` below selects the PPIO team
+  that will own the Control Sandbox and brokered Secrets; a separate browser
+  login is not required. The key must belong to a team in the `cn-beijing-1`
+  region (`cn-beijing-1.sandbox.ppio.com`), because brokered Secrets are only
+  available there.
+- A GitHub PAT that can manage self-hosted runners. For a classic PAT, use
+  `repo` for a repository target or `admin:org` for an organization target.
+  For a fine-grained PAT, grant repository `Administration: read and write` or
+  organization `Administration: read` plus
+  `Self-hosted runners: read and write`, respectively.
+- The exact repository or organization URL to register, such as
+  `https://github.com/ppio/github-actions-runner-controller`.
+
+Install and verify the CLI if needed:
+
+```bash
+npm install --global ppio-sandbox-cli@latest
+ppio --version
+```
+
+Export the three required values in the current shell. Do not put them in the
+repository:
+
+```bash
+export GITHUB_CONFIG_URL=https://github.com/OWNER/REPOSITORY
+export GITHUB_TOKEN=YOUR_GITHUB_PAT
+export PPIO_API_KEY=YOUR_PPIO_API_KEY
+```
+
+Verify that the CLI sees the intended team before deployment:
+
+```bash
+ppio auth info
+```
+
+`GITHUB_CONFIG_URL` is mandatory. The script rejects the example
+`OWNER/REPO` and `OWNER/REPOSITORY` placeholders so it cannot silently deploy
+against an unintended target.
+
+### Deploy
+
+Clone this repository and run the Hosted deployment:
+
+```bash
+git clone https://github.com/ppio/github-actions-runner-controller.git
+cd github-actions-runner-controller
+bash scripts/deploy-hosted.sh
+```
+
+After `cd`, run the deployment script from the cloned
+`github-actions-runner-controller/` repository root. The script runs on your
+machine and creates the long-running Controller Sandbox in PPIO.
+
+Success returns the stable target identity, Control Sandbox ID, and health state:
+
+```json
+{"targetId":"ppio-github-actions-runn-712433e3dc","controllerId":"ppio-hosted-ppio-github-actions-runn-712433e3dc","sandboxId":"...","healthy":true}
+```
+
+The default Scale Set label is `ppio-scale-set`. In the target repository,
+create or update `.github/workflows/ci.yml` (or another workflow file under
+`.github/workflows/`) and point each job that should use PPIO at this label:
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  test:
+    runs-on: ppio-scale-set
+```
+
+The controller creates or reuses the named Scale Set. It intentionally does
+not delete it on shutdown, allowing safe controller restarts.
+
+The deployment script creates or updates two brokered Secrets and starts a
+long-running Control Sandbox with a 60-year timeout and
+`pause + auto-resume`. It uses the public controller Template and creates job
+Sandboxes from the public runner Template. The Secrets must remain active for
+the full life of the resumable Control Sandbox. Kill that Sandbox before
+deleting them.
+After Sandbox creation, the script starts the controller through the Sandbox
+command API and waits for `/healthz`; this is required because a process saved
+in a template build snapshot does not inherit creation-time environment values.
+
+### Multiple repositories or organizations
+
+Run the deployment once for each GitHub repository or organization. By
+default, the script derives a stable target ID from the normalized
+`GITHUB_CONFIG_URL`. Each target receives its own controller identity, brokered
+Secrets, and long-running Control Sandbox, so deploying another target cannot
+reuse the first target's controller or overwrite its GitHub credential.
+
+```bash
+GITHUB_CONFIG_URL=https://github.com/ppio/github-actions-runner-controller \
+  bash scripts/deploy-hosted.sh
+```
+
+To add another project, replace `GITHUB_CONFIG_URL` with that repository or
+organization URL and run the same command again.
+
+Save the JSON output for operations. The resume script accepts either the
+exact Sandbox ID or the same GitHub target URL. Target-based lookup checks both
+running and paused Sandboxes and fails on duplicates instead of choosing one
+arbitrarily. Control Sandboxes created before target metadata was introduced
+must still be resumed by their Sandbox ID.
+
+When resuming manually, always preserve the intended lifetime:
+
+```bash
+scripts/resume-hosted.sh SANDBOX_ID
+GITHUB_CONFIG_URL=https://github.com/ppio/github-actions-runner-controller \
+  scripts/resume-hosted.sh
+# equivalent core commands:
+ppio sandbox resume SANDBOX_ID
+ppio sandbox set-timeout SANDBOX_ID 525600h
+```
+
+PPIO resets a resumed Sandbox to its short default lifetime (about five
+minutes), and `sandbox resume` does not take a timeout flag, so run
+`ppio sandbox set-timeout` right afterwards. The lifecycle remains
+`pause + auto-resume`, but without it the controller would pause again almost
+immediately.
+
+Local Docker and Hosted mode use the same controller OCI image. Hosted users
+use the two public Template names above; the Template definitions pin an
+immutable image version rather than `latest`.
+
+## Alternative: Local Docker
+
+Use Local mode when the controller should run on a machine you manage. Prepare
+Docker, the same GitHub PAT and PPIO API key described above, then run:
+
+```bash
+cp .env.example .env
+# Edit .env; it is ignored by Git.
+docker compose up -d
+curl http://127.0.0.1:8080/healthz
+```
+
+Local mode pulls the immutable
+`ppinfra/github-actions-controller:v0.1.2` image. Credentials are provided
+only through `GITHUB_TOKEN` and `PPIO_API_KEY` in `.env`. Use the same
+`runs-on: ppio-scale-set` workflow configuration shown above.
+
+## Custom runner Template
+
+To preinstall tools, build your own runner Template on top of the public
+runner image and point the controller at it. See the PPIO guide
+[Build Template](https://ppio.com/docs/sandbox/sandbox-template)
+for the full `ppio template create` reference.
+
+### 1. Write the Template Dockerfile
+
+Start from `templates/runner/ppio.Dockerfile`. Keep the three conventions
+the controller relies on: the `user` account, the `/home/user/actions-runner`
+directory, and the `entrypoint.sh` start command. The controller writes each
+job's JIT configuration into that directory and the entrypoint consumes it.
+
+```dockerfile
+# templates/runner/ppio.Dockerfile
+FROM ppinfra/github-actions-runner:v0.1.2
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config libssl-dev zstd \
+    && rm -rf /var/lib/apt/lists/*
+USER user
+CMD ["/home/user/actions-runner/entrypoint.sh"]
+```
+
+Add further `apt-get install` packages or tool downloads as needed. Install
+user-level tools such as rustup or nvm while `USER user` is active so they land
+in `/home/user`.
+
+### 2. Build the Template
+
+Choose a name that does not collide with the public `github-actions-runner`
+Template. Resources default to 2 vCPU and 4 GB; raise them for heavy compiles.
+
+```bash
+ppio template create my-gcc-runner \
+  --path templates/runner \
+  --dockerfile ppio.Dockerfile \
+  --cpu-count 4 --memory-mb 8192 \
+  --cmd /home/user/actions-runner/entrypoint.sh \
+  --ready-cmd 'test -x /home/user/actions-runner/entrypoint.sh'
+```
+
+`make runner-template RUNNER_TEMPLATE=my-gcc-runner` runs the same command
+with the default resource size. Rebuild with the same name after each
+Dockerfile change, or use a new name if the platform rejects a duplicate.
+
+### 3. Set `PPIO_RUNNER_TEMPLATE`
+
+Hosted mode reads the Template name at deployment time. Kill the existing
+Control Sandbox for the target, then redeploy with the override:
+
+```bash
+ppio sandbox kill CONTROL_SANDBOX_ID
+PPIO_RUNNER_TEMPLATE=my-gcc-runner bash scripts/deploy-hosted.sh
+```
+
+Local Docker mode reads it from `.env`:
+
+```bash
+PPIO_RUNNER_TEMPLATE=my-gcc-runner
+```
+
+Then `docker compose up -d`. Workflows do not change; re-run the failed job
+and it will land on the new Template. One controller uses exactly one runner
+Template. To offer several toolchains, deploy one controller per Template with
+distinct `SCALE_SET_NAME` values and select them with `runs-on`.
+
+## Scaling and recovery semantics
+
+- Desired runners are `min(MAX_RUNNERS, MIN_RUNNERS + TotalAssignedJobs)`.
+- Job availability is acquired before provisioning. GitHub can redeliver an
+  unacknowledged message; a stable pending runner name and metadata lookup make
+  create retries idempotent.
+- Job completion permanently kills its ephemeral Sandbox.
+- A periodic reconcile converges capacity even during quiet message polls.
+- Only controller-owned, paused Sandboxes older than `ORPHAN_GRACE` are orphan
+  candidates. Unknown running Sandboxes are preserved because they may be busy
+  after a controller restart.
+- `/healthz` reports process health; `/metrics` exposes creation, deletion, and
+  error counters in Prometheus text format.
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `GITHUB_CONFIG_URL` | required | Repository or organization URL |
+| `GITHUB_TOKEN` | required | GitHub PAT |
+| `PPIO_API_KEY` | required by SDK | PPIO team API key |
+| `PPIO_DOMAIN` | `cn-beijing-1.sandbox.ppio.com` in Hosted mode; SDK default `sandbox.ppio.cn` otherwise | PPIO Sandbox region domain; v2 region required for brokered Secrets |
+| `PPIO_RUNNER_TEMPLATE` | required | Runner Template name or ID; see [Custom runner Template](#custom-runner-template) |
+| `SCALE_SET_NAME` | `ppio` | Scale Set name |
+| `RUNNER_LABELS` | Scale Set name | Comma-separated labels |
+| `RUNNER_GROUP` | `default` | GitHub runner group |
+| `MIN_RUNNERS` / `MAX_RUNNERS` | `0` / `10` | Capacity bounds |
+| `RUNNER_TIMEOUT` | `1h` | Per-job Sandbox hard lifetime |
+| `RECONCILE_INTERVAL` | `30s` | Periodic convergence interval |
+| `ORPHAN_GRACE` | `15m` | Paused orphan retention |
+| `CONTROLLER_ID` | derived from target URL in Hosted mode | Ownership identity |
+| `METRICS_ADDR` | `:8080` | Health and metrics listen address |
+| `PYTHON` | `python3` | Python executable for the adapter |
+| `PPIO_ADAPTER` | `/app/provisioner/ppio/adapter.py` | Adapter path |
+
+Hosted deployment also accepts `CONTROLLER_TEMPLATE`, `GITHUB_SECRET_NAME`,
+`PPIO_SECRET_NAME`, and `CONTROL_TIMEOUT`. Explicit identity or Secret name
+overrides are intended for advanced operation; the per-target
+defaults are safer for normal multi-project deployments. `CONTROL_TIMEOUT`
+controls the lifetime used during deployment and by `scripts/resume-hosted.sh`.
+
+## Documentation
+
+See [Design notes](docs/design.md) for lifecycle ownership and failure
+boundaries.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

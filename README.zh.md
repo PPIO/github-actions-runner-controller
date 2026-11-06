@@ -1,0 +1,243 @@
+<div align="center">
+
+# PPIO Actions Runner Controller
+
+以更低成本、更便捷的方式，让每个 GitHub Actions Job 都运行在独立的 PPIO
+Sandbox 中。
+
+[English](https://github.com/ppio/github-actions-runner-controller/blob/main/README.md) | [中文](https://github.com/ppio/github-actions-runner-controller/blob/main/README.zh.md)
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Go](https://img.shields.io/badge/Go-1.27.3-00ADD8.svg)
+![Runner](https://img.shields.io/badge/GitHub_Actions_Runner-2.337.0-2088FF.svg)
+![Deployment](https://img.shields.io/badge/recommended-PPIO_Hosted-7B61FF.svg)
+
+</div>
+
+这是一个基于 GitHub Actions Runner Scale Set API 的控制器。它使用 GitHub
+官方 `github.com/actions/scaleset` 客户端接收 Job 和 Runner 容量需求。长时
+运行的 Controller 会为每个 Job 创建一个全新的 PPIO Runner Sandbox，
+任务结束后立即 kill。
+
+> v0.1 使用 GitHub 当前标记为 Public Preview 的 Scale Set API，并固定依赖
+> `github.com/actions/scaleset v0.5.0`。
+
+## 架构
+
+```mermaid
+flowchart LR
+    G["GitHub Actions<br/>分配 Job 和 JIT 配置"] --> C["Controller Sandbox<br/>github-actions-controller"]
+    C --> T["Runner Template<br/>github-actions-runner"]
+    T --> R["临时 Runner Sandbox<br/>每个 Job 一个"]
+    R --> K["Job 完成<br/>kill Sandbox"]
+```
+
+## 推荐：PPIO Hosted
+
+Controller 运行在长时运行的 PPIO Control Sandbox 中，再为
+每个 Job 创建临时 Runner Sandbox。Hosted 用户直接使用以下公共 Template，
+无需构建镜像或 Template：
+
+| 用途 | 公共 Template |
+|---|---|
+| Control Sandbox | `github-actions-controller` |
+| 临时 CI Runner | `github-actions-runner` |
+
+### 部署前准备
+
+在执行部署脚本的机器上准备：
+
+- Bash 和 Python 3。
+- 如果尚未安装 `ppio` CLI，还需要 Node.js 20+ 和 npm。
+- 最新版 `ppio` CLI（最低支持 2.1.0）。下面的 `PPIO_API_KEY` 会选择持有 Control
+  Sandbox 和 brokered Secret 的 PPIO Team，不需要额外浏览器登录。该 API Key
+  所属的 Team 必须位于 `cn-beijing-1` 区域（`cn-beijing-1.sandbox.ppio.com`），
+  因为 brokered Secret 仅在该区域可用。
+- 有权管理自托管 Runner 的 GitHub PAT。经典 PAT：仓库级目标使用 `repo`，
+  组织级目标使用 `admin:org`；细粒度 PAT：分别授予仓库
+  `Administration: read and write`，或为组织同时授予
+  `Administration: read` 和 `Self-hosted runners: read and write`。
+- 要注册的准确仓库或组织 URL，例如
+  `https://github.com/ppio/github-actions-runner-controller`。
+
+如未安装 CLI：
+
+```bash
+npm install --global ppio-sandbox-cli@latest
+ppio --version
+```
+
+在当前 Shell 导出三个必填值，不要写入仓库：
+
+```bash
+export GITHUB_CONFIG_URL=https://github.com/OWNER/REPOSITORY
+export GITHUB_TOKEN=YOUR_GITHUB_PAT
+export PPIO_API_KEY=YOUR_PPIO_API_KEY
+```
+
+部署前确认 CLI 识别到目标 Team：
+
+```bash
+ppio auth info
+```
+
+`GITHUB_CONFIG_URL` 必须显式配置。脚本会拒绝 `OWNER/REPO` 和
+`OWNER/REPOSITORY` 示例占位符，避免误部署到错误目标。
+
+### 部署
+
+```bash
+git clone https://github.com/ppio/github-actions-runner-controller.git
+cd github-actions-runner-controller
+bash scripts/deploy-hosted.sh
+```
+
+执行 `cd` 后，在克隆得到的 `github-actions-runner-controller/` 仓库根目录运行
+部署脚本。脚本运行在本机，并在 PPIO 中创建长时运行的 Controller Sandbox。
+
+部署成功会返回稳定的目标标识、Control Sandbox ID 和健康状态：
+
+```json
+{"targetId":"ppio-github-actions-runn-712433e3dc","controllerId":"ppio-hosted-ppio-github-actions-runn-712433e3dc","sandboxId":"...","healthy":true}
+```
+
+部署脚本会创建或更新两个 brokered Secret，并创建一个 60 年超时、
+`pause + auto-resume` 的长时运行 Control Sandbox。Secret 是这个可恢复
+Sandbox 的长期依赖；必须先 kill Control Sandbox，之后才能删除 Secret。
+
+默认 Scale Set 标签为 `ppio-scale-set`。在接入 CI 的目标仓库中创建或修改
+`.github/workflows/ci.yml`（也可以是 `.github/workflows/` 下的其他工作流文件），
+将需要使用 PPIO 的 Job 配置为：
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  test:
+    runs-on: ppio-scale-set
+```
+
+### 配置多个项目
+
+可以连续为多个 GitHub 仓库或组织部署。脚本会根据规范化后的
+`GITHUB_CONFIG_URL` 生成稳定的目标 ID；每个目标默认使用独立的 controller
+标识、brokered Secret 和长时运行 Control Sandbox，因此部署第二个项目不会
+复用第一个项目的 controller，也不会覆盖第一个项目的 GitHub 凭据。
+
+```bash
+GITHUB_CONFIG_URL=https://github.com/ppio/github-actions-runner-controller \
+  bash scripts/deploy-hosted.sh
+```
+
+如需增加其他项目，将 `GITHUB_CONFIG_URL` 替换为对应仓库或组织 URL，再重复执行
+同一条命令即可。
+
+请保留每次部署返回的 JSON。恢复脚本既可以直接使用 Sandbox ID，也可以用同一个
+GitHub 目标 URL 自动查找；它会同时检查 running 和 paused 状态。如果发现多个
+匹配项会直接报错，不会任意恢复其中一个。早于目标 metadata 功能创建的 Control
+Sandbox 仍需使用 Sandbox ID 恢复。
+
+手工恢复时必须显式保留长期超时：
+
+```bash
+scripts/resume-hosted.sh SANDBOX_ID
+GITHUB_CONFIG_URL=https://github.com/ppio/github-actions-runner-controller \
+  scripts/resume-hosted.sh
+# 等价的核心命令：
+ppio sandbox resume SANDBOX_ID
+ppio sandbox set-timeout SANDBOX_ID 525600h
+```
+
+`ppio sandbox resume` 不接受超时参数，平台会把恢复后的 Sandbox 重置为较短
+的默认生命周期（约五分钟），因此恢复后必须紧接着执行
+`ppio sandbox set-timeout` 重新设置长期超时。
+
+## 备选：Local Docker
+
+如果 controller 需要运行在用户管理的机器上，准备 Docker、同样的 GitHub
+PAT 和 PPIO API Key，然后执行：
+
+```bash
+cp .env.example .env
+# 编辑 .env；该文件已被 Git 忽略。
+docker compose up -d
+curl http://127.0.0.1:8080/healthz
+```
+
+Local 模式直接拉取固定的
+`ppinfra/github-actions-controller:v0.1.2`，并只通过 `.env` 中的
+`GITHUB_TOKEN` 和 `PPIO_API_KEY` 提供凭据。工作流仍使用上面的
+`runs-on: ppio-scale-set`。
+
+每个 Job 使用 GitHub 下发的 JIT 配置注册临时 Runner。JIT 配置通过
+Sandbox 文件系统原子写入，Runner 读取后立即删除；它不会进入 Sandbox
+环境变量、metadata、进程参数或 controller 日志。
+
+## 自定义 Runner Template
+
+需要预装工具时，在公共 runner 镜像之上构建自己的 Template，再让
+controller 使用它。`ppio template create` 的完整说明见 PPIO 文档
+[Build Template](https://ppio.com/docs/sandbox/sandbox-template)。
+
+### 1. 编写 Template Dockerfile
+
+以 `templates/runner/ppio.Dockerfile` 为起点。必须保留 controller 依赖的
+三个约定：`user` 用户、`/home/user/actions-runner` 目录和 `entrypoint.sh`
+启动命令。controller
+会把每个 Job 的 JIT 配置写入该目录，由入口脚本读取。
+
+```dockerfile
+# templates/runner/ppio.Dockerfile
+FROM ppinfra/github-actions-runner:v0.1.2
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config libssl-dev zstd \
+    && rm -rf /var/lib/apt/lists/*
+USER user
+CMD ["/home/user/actions-runner/entrypoint.sh"]
+```
+
+按需追加 `apt-get install` 包或下载其他工具。rustup、nvm 这类用户级工具
+请在 `USER user` 之后安装，使其落在 `/home/user` 下。
+
+### 2. 构建 Template
+
+名字不要与公共的 `github-actions-runner` 冲突。默认规格为 2 vCPU、4 GB
+内存，重编译任务建议调大：
+
+```bash
+ppio template create my-gcc-runner \
+  --path templates/runner \
+  --dockerfile ppio.Dockerfile \
+  --cpu-count 4 --memory-mb 8192 \
+  --cmd /home/user/actions-runner/entrypoint.sh \
+  --ready-cmd 'test -x /home/user/actions-runner/entrypoint.sh'
+```
+
+`make runner-template RUNNER_TEMPLATE=my-gcc-runner` 会以默认规格执行同一
+条命令。每次修改 Dockerfile 后用相同名字重新构建；如果平台拒绝重名，换
+一个新名字。
+
+### 3. 设置 `PPIO_RUNNER_TEMPLATE`
+
+Hosted 模式在部署时读取 Template 名。先 kill 该目标现有的 Control
+Sandbox，再带上覆盖值重新部署：
+
+```bash
+ppio sandbox kill CONTROL_SANDBOX_ID
+PPIO_RUNNER_TEMPLATE=my-gcc-runner bash scripts/deploy-hosted.sh
+```
+
+Local Docker 模式在 `.env` 中设置：
+
+```bash
+PPIO_RUNNER_TEMPLATE=my-gcc-runner
+```
+
+然后执行 `docker compose up -d`。工作流无需修改，重新运行失败的 Job 即可
+落到新 Template 上。一个 controller 只使用一个 runner Template；需要多套
+工具链时，为每个 Template 部署一个 controller，使用不同的 `SCALE_SET_NAME`
+并通过 `runs-on` 区分。
+
+## License
+
+本项目使用 [MIT License](LICENSE)。
